@@ -29,4 +29,10 @@ impl<'a> AppUserDao<'a> {
             }
         }
     }
+
+    pub fn update_balance(&self, user_id: i32, amount_change: f64) -> Result<()> {
+        let sql = "UPDATE AppUser SET wallet_balance = wallet_balance + :1 WHERE user_id = :2";
+        self.conn.execute(sql, &[&amount_change, &user_id])?;
+        Ok(())
+    }
 }

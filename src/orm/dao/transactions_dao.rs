@@ -1,6 +1,14 @@
 #![allow(dead_code)]
 
 use oracle::{Connection, Result};
+use crate::orm::dao::app_user_dao::AppUserDao;
+use crate::orm::dao::game_dao::GameDao;
+use crate::orm::dao::library_dao::LibraryDao;
+use crate::orm::dao::review_dao::ReviewDao;
+use crate::orm::dao::wallet_transaction_dao::WalletTransactionDao;
+use crate::orm::dto::library::Library;
+use crate::orm::dto::review::Review;
+use crate::orm::dto::wallet_transaction::WalletTransaction;
 
 pub struct TransactionsDao<'a> {
     conn: &'a Connection,
@@ -25,52 +33,51 @@ impl<'a> TransactionsDao<'a> {
         let _ = self.conn.rollback();
         self.conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", &[])?;
 
-        let target_user_id = if p_is_gift { p_recipient_user_id.unwrap() } else { p_user_id };
+        let user_dao = AppUserDao::new(self.conn);
+        let game_dao = GameDao::new(self.conn);
+        let library_dao = LibraryDao::new(self.conn);
 
-        let count: i32 = self.conn.query_row_as(
-            "SELECT COUNT(*) FROM Library WHERE user_id = :1 AND game_id = :2",
-            &[&target_user_id, &p_selected_game_id],
-        )?;
-
-        if count > 0 {
-            self.conn.rollback()?;
-            return Ok(false);
-        }
-
-        let sql_check = "
-            SELECT g.price, u.wallet_balance 
-            FROM Game g, AppUser u 
-            WHERE g.game_id = :1 AND u.user_id = :2
-        ";
-        
-        let row = match self.conn.query_row(sql_check, &[&p_selected_game_id, &p_user_id]) {
-            Ok(r) => r,
-            Err(_) => {
+        let buyer = match user_dao.get_by_id(p_user_id)? {
+            Some(u) => u,
+            None => {
                 self.conn.rollback()?;
                 return Ok(false);
             }
         };
 
-        let price: f64 = row.get(0)?;
-        let balance: f64 = row.get(1)?;
+        let game = match game_dao.get_by_id(p_selected_game_id)? {
+            Some(g) => g,
+            None => {
+                self.conn.rollback()?;
+                return Ok(false);
+            }
+        };
 
-        if balance < price {
+        let target_user_id = if p_is_gift { p_recipient_user_id.expect("Recipient ID must be provided for gifts") } else { p_user_id };
+
+        if library_dao.exists(target_user_id, p_selected_game_id)? {
             self.conn.rollback()?;
             return Ok(false);
         }
 
-        if let Err(e) = self.conn.execute(
-            "INSERT INTO Library (user_id, game_id, purchase_price) VALUES (:1, :2, :3)",
-            &[&target_user_id, &p_selected_game_id, &price],
-        ) {
+        if buyer.wallet_balance < game.price {
+            self.conn.rollback()?;
+            return Ok(false);
+        }
+
+        let lib_entry = Library {
+            library_id: 0,
+            user_id: target_user_id,
+            game_id: p_selected_game_id,
+            purchase_price: game.price,
+        };
+
+        if let Err(e) = library_dao.insert(&lib_entry) {
             let _ = self.conn.rollback();
             return Err(e);
         }
 
-        if let Err(e) = self.conn.execute(
-            "UPDATE AppUser SET wallet_balance = wallet_balance - :1 WHERE user_id = :2",
-            &[&price, &p_user_id],
-        ) {
+        if let Err(e) = user_dao.update_balance(p_user_id, -game.price) {
             let _ = self.conn.rollback();
             return Err(e);
         }
@@ -119,18 +126,21 @@ impl<'a> TransactionsDao<'a> {
         let _ = self.conn.rollback(); 
         self.conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", &[])?;
 
-        if let Err(e) = self.conn.execute(
-            "INSERT INTO WalletTransaction (user_id, amount) VALUES (:1, :2)",
-            &[&p_user_id, &p_amount],
-        ) {
+        let user_dao = AppUserDao::new(self.conn);
+        let tx_dao = WalletTransactionDao::new(self.conn);
+
+        let tx = WalletTransaction {
+            transaction_id: 0,
+            user_id: p_user_id,
+            amount: p_amount,
+        };
+
+        if let Err(e) = tx_dao.insert(&tx) {
             let _ = self.conn.rollback();
             return Err(e);
         }
 
-        if let Err(e) = self.conn.execute(
-            "UPDATE AppUser SET wallet_balance = wallet_balance + :1 WHERE user_id = :2",
-            &[&p_amount, &p_user_id],
-        ) {
+        if let Err(e) = user_dao.update_balance(p_user_id, p_amount) {
             let _ = self.conn.rollback();
             return Err(e);
         }
@@ -154,41 +164,35 @@ impl<'a> TransactionsDao<'a> {
         let _ = self.conn.rollback();
         self.conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", &[])?;
 
-        let sql_lib = "SELECT game_id FROM Library WHERE library_id = :1 AND user_id = :2";
-        let game_id: i32 = match self.conn.query_row_as(sql_lib, &[&p_library_game_id, &p_user_id]) {
-            Ok(id) => id,
-            Err(_) => {
+        let library_dao = LibraryDao::new(self.conn);
+        let review_dao = ReviewDao::new(self.conn);
+
+        let game_id = match library_dao.get_game_id(p_library_game_id, p_user_id)? {
+            Some(id) => id,
+            None => {
                 self.conn.rollback()?;
                 return Ok(false);
             }
         };
 
-        let sql_rev = "SELECT review_id FROM Review WHERE user_id = :1 AND game_id = :2";
-        let review_id: Option<i32> = match self.conn.query_row_as(sql_rev, &[&p_user_id, &game_id]) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                if e.kind() == oracle::ErrorKind::NoDataFound {
-                    None
-                } else {
-                    self.conn.rollback()?;
-                    return Err(e);
-                }
-            }
-        };
+        let existing_review = review_dao.get_by_user_and_game(p_user_id, game_id)?;
 
-        if let Some(r_id) = review_id {
-            if let Err(e) = self.conn.execute(
-                "UPDATE Review SET rating = :1, review_comment = :2 WHERE review_id = :3",
-                &[&p_rating, &p_comment, &r_id],
-            ) {
+        if let Some(mut rev) = existing_review {
+            rev.rating = p_rating;
+            rev.review_comment = p_comment.to_string();
+            if let Err(e) = review_dao.update(&rev) {
                 let _ = self.conn.rollback();
                 return Err(e);
             }
         } else {
-            if let Err(e) = self.conn.execute(
-                "INSERT INTO Review (user_id, game_id, rating, review_comment) VALUES (:1, :2, :3, :4)",
-                &[&p_user_id, &game_id, &p_rating, &p_comment],
-            ) {
+            let new_rev = Review {
+                review_id: 0,
+                user_id: p_user_id,
+                game_id,
+                rating: p_rating,
+                review_comment: p_comment.to_string(),
+            };
+            if let Err(e) = review_dao.insert(&new_rev) {
                 let _ = self.conn.rollback();
                 return Err(e);
             }
