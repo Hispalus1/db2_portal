@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct Library {
     pub library_id: i32,

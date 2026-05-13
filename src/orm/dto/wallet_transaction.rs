@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct WalletTransaction {
     pub transaction_id: i32,
